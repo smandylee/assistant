@@ -1,4 +1,9 @@
 import os
+import json
+import math
+import re
+import time
+from pathlib import Path
 from dotenv import load_dotenv
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import google
@@ -35,6 +40,116 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return " ".join(parts).strip()
+    return str(content)
+
+
+def _tokenize(text: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[0-9A-Za-z가-힣]+", text)}
+
+
+class LocalMemoryStore:
+    def __init__(self, file_path: str):
+        self.path = Path(file_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.touch()
+
+    def add(self, role: str, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        row = {"role": role, "text": text, "ts": time.time()}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _read_all(self) -> list[dict]:
+        rows: list[dict] = []
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return rows
+
+    def search(self, query: str, top_k: int = 3, min_score: float = 0.1) -> list[dict]:
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return []
+
+        now = time.time()
+        scored: list[tuple[float, dict]] = []
+        for row in self._read_all():
+            text = str(row.get("text", "")).strip()
+            if not text:
+                continue
+            d_tokens = _tokenize(text)
+            if not d_tokens:
+                continue
+
+            overlap = len(q_tokens & d_tokens) / math.sqrt(len(q_tokens) * len(d_tokens))
+            age_h = max(0.0, (now - float(row.get("ts", now))) / 3600.0)
+            recency_bonus = 0.05 / (1.0 + age_h)
+            score = overlap + recency_bonus
+            if score >= min_score:
+                scored.append((score, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [row for _, row in scored[:top_k]]
+
+
+class FaustAgent(Agent):
+    def __init__(self, memory_store: LocalMemoryStore, memory_top_k: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.memory_store = memory_store
+        self.memory_top_k = memory_top_k
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        user_text = _extract_text(new_message.content).strip()
+        if not user_text:
+            return
+
+        self.memory_store.add("user", user_text)
+        memories = self.memory_store.search(user_text, top_k=self.memory_top_k)
+        if not memories:
+            return
+
+        memory_lines = []
+        for m in memories:
+            role = m.get("role", "memo")
+            text = str(m.get("text", "")).strip()
+            if text:
+                memory_lines.append(f"- ({role}) {text}")
+
+        if not memory_lines:
+            return
+
+        turn_ctx.add_message(
+            role="system",
+            content=(
+                "아래는 현재 질문과 관련된 과거 대화 메모입니다. "
+                "사실 확인용으로만 참고하고, 없거나 모호하면 추측하지 마세요.\n"
+                + "\n".join(memory_lines)
+            ),
+        )
+
+
 async def entrypoint(ctx: JobContext):
     # 워커가 룸에 접속하고 사용자를 기다립니다.
     await ctx.connect()
@@ -42,6 +157,9 @@ async def entrypoint(ctx: JobContext):
 
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     tts_voice = os.getenv("GOOGLE_TTS_VOICE", "ko-KR-Neural2-A")
+    memory_file = os.getenv("MEMORY_FILE", "memory/memory.jsonl")
+    memory_top_k = _get_int_env("MEMORY_TOP_K", 3)
+    memory_store = LocalMemoryStore(memory_file)
 
     session = AgentSession(
         stt=google.STT(languages="ko-KR", detect_language=False, interim_results=True),
@@ -57,7 +175,9 @@ async def entrypoint(ctx: JobContext):
         max_endpointing_delay=_get_float_env("MAX_ENDPOINTING_DELAY", 2.0),
     )
 
-    agent = Agent(
+    agent = FaustAgent(
+        memory_store=memory_store,
+        memory_top_k=memory_top_k,
         instructions="당신은 정중한 버틀러 '파우스트'입니다. 한국어로 짧고 명료하게 답하십시오."
     )
 
@@ -116,6 +236,15 @@ async def entrypoint(ctx: JobContext):
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev) -> None:
         _log(f"agent_state {ev.old_state} -> {ev.new_state}")
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev) -> None:
+        item = ev.item
+        role = getattr(item, "role", "")
+        if role == "assistant":
+            text = _extract_text(getattr(item, "content", ""))
+            if text.strip():
+                memory_store.add("assistant", text)
 
     @session.on("error")
     def _on_error(ev) -> None:
