@@ -3,6 +3,7 @@ import json
 import math
 import re
 import time
+from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
@@ -61,8 +62,9 @@ def _tokenize(text: str) -> set[str]:
 
 
 class LocalMemoryStore:
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, max_scan_rows: int = 300):
         self.path = Path(file_path)
+        self.max_scan_rows = max_scan_rows
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.touch()
@@ -75,8 +77,8 @@ class LocalMemoryStore:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def _read_all(self) -> list[dict]:
-        rows: list[dict] = []
+    def _read_recent(self) -> list[dict]:
+        rows: deque[dict] = deque(maxlen=max(1, self.max_scan_rows))
         with self.path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -86,7 +88,7 @@ class LocalMemoryStore:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-        return rows
+        return list(rows)
 
     def search(self, query: str, top_k: int = 3, min_score: float = 0.1) -> list[dict]:
         q_tokens = _tokenize(query)
@@ -95,7 +97,7 @@ class LocalMemoryStore:
 
         now = time.time()
         scored: list[tuple[float, dict]] = []
-        for row in self._read_all():
+        for row in self._read_recent():
             text = str(row.get("text", "")).strip()
             if not text:
                 continue
@@ -115,10 +117,18 @@ class LocalMemoryStore:
 
 
 class FaustAgent(Agent):
-    def __init__(self, memory_store: LocalMemoryStore, memory_top_k: int, *args, **kwargs):
+    def __init__(
+        self,
+        memory_store: LocalMemoryStore,
+        memory_top_k: int,
+        memory_min_score: float,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.memory_store = memory_store
         self.memory_top_k = memory_top_k
+        self.memory_min_score = memory_min_score
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         user_text = _extract_text(new_message.content).strip()
@@ -126,7 +136,9 @@ class FaustAgent(Agent):
             return
 
         self.memory_store.add("user", user_text)
-        memories = self.memory_store.search(user_text, top_k=self.memory_top_k)
+        memories = self.memory_store.search(
+            user_text, top_k=self.memory_top_k, min_score=self.memory_min_score
+        )
         if not memories:
             return
 
@@ -135,7 +147,7 @@ class FaustAgent(Agent):
             role = m.get("role", "memo")
             text = str(m.get("text", "")).strip()
             if text:
-                memory_lines.append(f"- ({role}) {text}")
+                memory_lines.append(f"[과거 기억][{role}] {text}")
 
         if not memory_lines:
             return
@@ -159,7 +171,9 @@ async def entrypoint(ctx: JobContext):
     tts_voice = os.getenv("GOOGLE_TTS_VOICE", "ko-KR-Neural2-A")
     memory_file = os.getenv("MEMORY_FILE", "memory/memory.jsonl")
     memory_top_k = _get_int_env("MEMORY_TOP_K", 3)
-    memory_store = LocalMemoryStore(memory_file)
+    memory_min_score = _get_float_env("MEMORY_MIN_SCORE", 0.1)
+    memory_scan_rows = _get_int_env("MEMORY_SCAN_ROWS", 300)
+    memory_store = LocalMemoryStore(memory_file, max_scan_rows=memory_scan_rows)
 
     session = AgentSession(
         stt=google.STT(languages="ko-KR", detect_language=False, interim_results=True),
@@ -178,6 +192,7 @@ async def entrypoint(ctx: JobContext):
     agent = FaustAgent(
         memory_store=memory_store,
         memory_top_k=memory_top_k,
+        memory_min_score=memory_min_score,
         instructions="당신은 정중한 버틀러 '파우스트'입니다. 한국어로 짧고 명료하게 답하십시오."
     )
 
