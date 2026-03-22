@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 gcp-key.json
+node_modules/
+tts-output/
+*.mp3
+*.wav
+memory/

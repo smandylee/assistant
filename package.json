@@ -1,0 +1,14 @@
+{
+  "name": "faust-desktop",
+  "version": "0.1.0",
+  "description": "Faust desktop controller with text chat",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^37.2.0"
+  }
+}
